@@ -3,10 +3,10 @@ package cos
 import (
 	"crypto/hmac"
 	"crypto/sha1"
-	"encoding/json"
+	"crypto/tls"
 	"fmt"
 	"hash"
-	"io/ioutil"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -15,21 +15,12 @@ import (
 	"time"
 )
 
-const (
-	sha1SignAlgorithm   = "sha1"
-	privateHeaderPrefix = "x-cos-"
-	defaultAuthExpire   = time.Hour
-)
-
-var (
-	defaultCVMAuthExpire = int64(600)
-	defaultCVMSchema     = "http"
-	defaultCVMMetaHost   = "metadata.tencentyun.com"
-	defaultCVMCredURI    = "latest/meta-data/cam/security-credentials"
-)
+const sha1SignAlgorithm = "sha1"
+const privateHeaderPrefix = "x-cos-"
+const defaultAuthExpire = time.Hour
 
 // 需要校验的 Headers 列表
-var NeedSignHeaders = map[string]bool{
+var needSignHeaders = map[string]bool{
 	"host":                           true,
 	"range":                          true,
 	"x-cos-acl":                      true,
@@ -48,25 +39,21 @@ var NeedSignHeaders = map[string]bool{
 	"content-type":                   true,
 	"content-length":                 true,
 	"content-md5":                    true,
-	"transfer-encoding":              true,
-	"versionid":                      true,
 	"expect":                         true,
 	"expires":                        true,
 	"x-cos-content-sha1":             true,
 	"x-cos-storage-class":            true,
-	"if-match":                       true,
 	"if-modified-since":              true,
-	"if-none-match":                  true,
-	"if-unmodified-since":            true,
 	"origin":                         true,
 	"access-control-request-method":  true,
 	"access-control-request-headers": true,
 	"x-cos-object-type":              true,
 }
 
-// 非线程安全，只能在进程初始化（而不是Client初始化）时做设置
-func SetNeedSignHeaders(key string, val bool) {
-	NeedSignHeaders[key] = val
+var ciParameters = map[string]bool{
+	"imagemogr2/": true,
+	"watermark/":  true,
+	"imageview2/": true,
 }
 
 func safeURLEncode(s string) string {
@@ -82,7 +69,7 @@ func safeURLEncode(s string) string {
 type valuesSignMap map[string][]string
 
 func (vs valuesSignMap) Add(key, value string) {
-	key = strings.ToLower(safeURLEncode(key))
+	key = strings.ToLower(key)
 	vs[key] = append(vs[key], value)
 }
 
@@ -100,7 +87,7 @@ func (vs valuesSignMap) Encode() string {
 		for _, val := range items {
 			pairs = append(
 				pairs,
-				fmt.Sprintf("%s=%s", k, safeURLEncode(val)))
+				fmt.Sprintf("%s=%s", safeURLEncode(k), safeURLEncode(val)))
 		}
 	}
 	return strings.Join(pairs, "&")
@@ -141,14 +128,12 @@ func (a *AuthTime) keyString() string {
 }
 
 // newAuthorization 通过一系列步骤生成最终需要的 Authorization 字符串
-func newAuthorization(secretID, secretKey string, req *http.Request, authTime *AuthTime, signHost bool) string {
+func newAuthorization(secretID, secretKey string, req *http.Request, authTime *AuthTime) string {
 	signTime := authTime.signString()
 	keyTime := authTime.keyString()
 	signKey := calSignKey(secretKey, keyTime)
 
-	if signHost {
-		req.Header.Set("Host", req.Host)
-	}
+	req.Header.Set("Host", req.Host)
 	formatHeaders := *new(string)
 	signedHeaderList := *new([]string)
 	formatHeaders, signedHeaderList = genFormatHeaders(req.Header)
@@ -171,7 +156,7 @@ func AddAuthorizationHeader(secretID, secretKey string, sessionToken string, req
 	}
 
 	auth := newAuthorization(secretID, secretKey, req,
-		authTime, true,
+		authTime,
 	)
 	if len(sessionToken) > 0 {
 		req.Header.Set("x-cos-security-token", sessionToken)
@@ -226,9 +211,12 @@ func genFormatString(method string, uri url.URL, formatParameters, formatHeaders
 func genFormatParameters(parameters url.Values) (formatParameters string, signedParameterList []string) {
 	ps := valuesSignMap{}
 	for key, values := range parameters {
+		key = strings.ToLower(key)
 		for _, value := range values {
-			ps.Add(key, value)
-			signedParameterList = append(signedParameterList, strings.ToLower(safeURLEncode(key)))
+			if !isCIParameter(key) {
+				ps.Add(key, value)
+				signedParameterList = append(signedParameterList, key)
+			}
 		}
 	}
 	//formatParameters = strings.ToLower(ps.Encode())
@@ -241,10 +229,11 @@ func genFormatParameters(parameters url.Values) (formatParameters string, signed
 func genFormatHeaders(headers http.Header) (formatHeaders string, signedHeaderList []string) {
 	hs := valuesSignMap{}
 	for key, values := range headers {
-		if isSignHeader(strings.ToLower(key)) {
-			for _, value := range values {
+		key = strings.ToLower(key)
+		for _, value := range values {
+			if isSignHeader(key) {
 				hs.Add(key, value)
-				signedHeaderList = append(signedHeaderList, strings.ToLower(safeURLEncode(key)))
+				signedHeaderList = append(signedHeaderList, key)
 			}
 		}
 	}
@@ -267,8 +256,17 @@ func calHMACDigest(key, msg, signMethod string) []byte {
 	return h.Sum(nil)
 }
 
+func isCIParameter(key string) bool {
+	for k, v := range ciParameters {
+		if strings.HasPrefix(key, k) && v {
+			return true
+		}
+	}
+	return false
+}
+
 func isSignHeader(key string) bool {
-	for k, v := range NeedSignHeaders {
+	for k, v := range needSignHeaders {
 		if key == k && v {
 			return true
 		}
@@ -284,6 +282,7 @@ type AuthorizationTransport struct {
 	rwLocker     sync.RWMutex
 	// 签名多久过期
 	Expire    time.Duration
+	SkipTls   bool
 	Transport http.RoundTripper
 }
 
@@ -306,17 +305,13 @@ func (t *AuthorizationTransport) GetCredential() (string, string, string) {
 // RoundTrip implements the RoundTripper interface.
 func (t *AuthorizationTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req = cloneRequest(req) // per RoundTrip contract
+	if t.Expire == time.Duration(0) {
+		t.Expire = defaultAuthExpire
+	}
 
 	ak, sk, token := t.GetCredential()
-	if strings.HasPrefix(ak, " ") || strings.HasSuffix(ak, " ") {
-		return nil, fmt.Errorf("SecretID is invalid")
-	}
-	if strings.HasPrefix(sk, " ") || strings.HasSuffix(sk, " ") {
-		return nil, fmt.Errorf("SecretKey is invalid")
-	}
-
 	// 增加 Authorization header
-	authTime := NewAuthTime(defaultAuthExpire)
+	authTime := NewAuthTime(t.Expire)
 	AddAuthorizationHeader(ak, sk, token, req, authTime)
 
 	resp, err := t.transport().RoundTrip(req)
@@ -327,122 +322,20 @@ func (t *AuthorizationTransport) transport() http.RoundTripper {
 	if t.Transport != nil {
 		return t.Transport
 	}
-	return http.DefaultTransport
-}
-
-type CVMSecurityCredentials struct {
-	TmpSecretId  string `json:",omitempty"`
-	TmpSecretKey string `json:",omitempty"`
-	ExpiredTime  int64  `json:",omitempty"`
-	Expiration   string `json:",omitempty"`
-	Token        string `json:",omitempty"`
-	Code         string `json:",omitempty"`
-}
-
-type CVMCredentialsTransport struct {
-	RoleName     string
-	Transport    http.RoundTripper
-	secretID     string
-	secretKey    string
-	sessionToken string
-	expiredTime  int64
-	rwLocker     sync.RWMutex
-}
-
-func (t *CVMCredentialsTransport) GetRoles() ([]string, error) {
-	urlname := fmt.Sprintf("%s://%s/%s", defaultCVMSchema, defaultCVMMetaHost, defaultCVMCredURI)
-	resp, err := http.Get(urlname)
-	if err != nil {
-		return nil, err
+	tlsClientConf := &tls.Config{InsecureSkipVerify: t.SkipTls}
+	// transport := &http.DefaultTransport{TLSClientConfig: tlsClientConf}
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig:       tlsClientConf,
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		bs, _ := ioutil.ReadAll(resp.Body)
-		return nil, fmt.Errorf("get cvm security-credentials role failed, StatusCode: %v, Body: %v", resp.StatusCode, string(bs))
-	}
-	bs, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	roles := strings.Split(strings.TrimSpace(string(bs)), "\n")
-	if len(roles) == 0 {
-		return nil, fmt.Errorf("get cvm security-credentials role failed, No valid cam role was found")
-	}
-	return roles, nil
-}
-
-// https://cloud.tencent.com/document/product/213/4934
-func (t *CVMCredentialsTransport) UpdateCredential(now int64) (string, string, string, error) {
-	t.rwLocker.Lock()
-	defer t.rwLocker.Unlock()
-	if t.expiredTime > now+defaultCVMAuthExpire {
-		return t.secretID, t.secretKey, t.sessionToken, nil
-	}
-	roleName := t.RoleName
-	if roleName == "" {
-		roles, err := t.GetRoles()
-		if err != nil {
-			return t.secretID, t.secretKey, t.sessionToken, err
-		}
-		roleName = roles[0]
-	}
-	urlname := fmt.Sprintf("%s://%s/%s/%s", defaultCVMSchema, defaultCVMMetaHost, defaultCVMCredURI, roleName)
-	resp, err := http.Get(urlname)
-	if err != nil {
-		return t.secretID, t.secretKey, t.sessionToken, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		bs, _ := ioutil.ReadAll(resp.Body)
-		return t.secretID, t.secretKey, t.sessionToken, fmt.Errorf("call cvm security-credentials failed, StatusCode: %v, Body: %v", resp.StatusCode, string(bs))
-	}
-	var cred CVMSecurityCredentials
-	err = json.NewDecoder(resp.Body).Decode(&cred)
-	if err != nil {
-		return t.secretID, t.secretKey, t.sessionToken, err
-	}
-	if cred.Code != "Success" {
-		return t.secretID, t.secretKey, t.sessionToken, fmt.Errorf("call cvm security-credentials failed, Code:%v", cred.Code)
-	}
-	t.secretID, t.secretKey, t.sessionToken, t.expiredTime = cred.TmpSecretId, cred.TmpSecretKey, cred.Token, cred.ExpiredTime
-	return t.secretID, t.secretKey, t.sessionToken, nil
-}
-
-func (t *CVMCredentialsTransport) GetCredential() (string, string, string, error) {
-	now := time.Now().Unix()
-	t.rwLocker.RLock()
-	// 提前 defaultCVMAuthExpire 获取重新获取临时密钥
-	if t.expiredTime <= now+defaultCVMAuthExpire {
-		expiredTime := t.expiredTime
-		t.rwLocker.RUnlock()
-		secretID, secretKey, secretToken, err := t.UpdateCredential(now)
-		// 获取临时密钥失败但密钥未过期
-		if err != nil && now < expiredTime {
-			err = nil
-		}
-		return secretID, secretKey, secretToken, err
-	}
-	defer t.rwLocker.RUnlock()
-	return t.secretID, t.secretKey, t.sessionToken, nil
-}
-
-func (t *CVMCredentialsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	ak, sk, token, err := t.GetCredential()
-	if err != nil {
-		return nil, err
-	}
-	req = cloneRequest(req)
-	// 增加 Authorization header
-	authTime := NewAuthTime(defaultAuthExpire)
-	AddAuthorizationHeader(ak, sk, token, req, authTime)
-
-	resp, err := t.transport().RoundTrip(req)
-	return resp, err
-}
-
-func (t *CVMCredentialsTransport) transport() http.RoundTripper {
-	if t.Transport != nil {
-		return t.Transport
-	}
-	return http.DefaultTransport
+	// return transport
 }
